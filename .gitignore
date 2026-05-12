@@ -1,0 +1,12 @@
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+dist/
+.env
+reporte..xlsx
+~$*
+.claude/
+docs/
+*.pdf
