@@ -7,6 +7,7 @@ Los archivos de entrada son reportes ya procesados (no el padrón crudo),
 con columnas de dosis individuales como 'BCG', '1° Penta', 'Varicela', etc.
 """
 
+import io
 import re
 import datetime
 import pandas as pd
@@ -113,7 +114,7 @@ def load_reporte(file_bytes: bytes) -> pd.DataFrame:
     Espera cualquier hoja (sheet_name=0) con columnas:
     DNI, Nombres, RIS, Zona Sanitaria, EESS, Prioridad + columnas de dosis.
     """
-    df = pd.read_excel(file_bytes, sheet_name=0, dtype={'DNI': str})
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, dtype={'DNI': str})
     if 'DNI' in df.columns:
         df['DNI'] = df['DNI'].astype(str).str.strip()
     return df
