@@ -231,36 +231,59 @@ def compare_reportes(df_a: pd.DataFrame, df_b: pd.DataFrame) -> list[dict]:
 def to_dataframe(results: list[dict], dose_filter: list[str] | None = None,
                  cat_filter: str | None = None) -> pd.DataFrame:
     """
-    Convierte los resultados en un DataFrame listo para mostrar.
+    Convierte los resultados en DataFrame EXPANDIDO: una fila por niño por vacuna.
 
-    dose_filter — si se indica, solo incluye filas donde alguna de esas
-                  vacunas aparece en administradas o pendientes.
+    Esto permite visualizar el estado de cada dosis de manera independiente.
+
+    dose_filter — lista de vacunas a mostrar (None = todas)
     cat_filter  — 'se_vacuno' | 'sigue_faltando' | 'parcial' | None (todos)
     """
+    COLS = [
+        'RIS', 'Zona Sanitaria', 'EESS', 'DNI', 'Nombres',
+        'Prioridad actual', 'Categoría', 'Vacuna', 'Estado del periodo',
+    ]
+
     rows = []
     for r in results:
         if cat_filter and r['categoria'] not in _cat_keys(cat_filter):
             continue
+
+        administradas = list(r.get('vacunas_administradas', []))
+        pendientes    = list(r.get('vacunas_pendientes',    []))
+
+        # Filtrar por vacuna específica si se indicó
         if dose_filter:
-            relevant = set(r.get('vacunas_administradas', [])) | set(r.get('vacunas_pendientes', []))
-            if not relevant.intersection(dose_filter):
+            administradas = [v for v in administradas if v in dose_filter]
+            pendientes    = [v for v in pendientes    if v in dose_filter]
+            if not administradas and not pendientes:
                 continue
-        rows.append({
-            'RIS':                   r['RIS'],
-            'Zona Sanitaria':        r['Zona Sanitaria'],
-            'EESS':                  r['EESS'],
-            'DNI':                   r['DNI'],
-            'Nombres':               r['Nombres'],
-            'Prioridad actual':      r['Prioridad'],
-            'Categoría':             _cat_label(r['categoria']),
-            'Vacunas administradas': ', '.join(r.get('vacunas_administradas', [])) or '—',
-            'Vacunas pendientes':    ', '.join(r.get('vacunas_pendientes', []))    or '—',
-        })
-    return pd.DataFrame(rows) if rows else pd.DataFrame(
-        columns=['RIS', 'Zona Sanitaria', 'EESS', 'DNI', 'Nombres',
-                 'Prioridad actual', 'Categoría',
-                 'Vacunas administradas', 'Vacunas pendientes']
-    )
+
+        base = {
+            'RIS':              r['RIS'],
+            'Zona Sanitaria':   r['Zona Sanitaria'],
+            'EESS':             r['EESS'],
+            'DNI':              r['DNI'],
+            'Nombres':          r['Nombres'],
+            'Prioridad actual': r['Prioridad'],
+            'Categoría':        _cat_label(r['categoria']),
+        }
+
+        for vac in administradas:
+            rows.append({**base,
+                         'Vacuna':             vac,
+                         'Estado del periodo': '✅ Vacunado en el periodo'})
+        for vac in pendientes:
+            rows.append({**base,
+                         'Vacuna':             vac,
+                         'Estado del periodo': '❌ Pendiente'})
+
+        # Niños sin dosis relevantes (nuevo sin pendientes, retirado)
+        if not administradas and not pendientes:
+            rows.append({**base,
+                         'Vacuna':             '—',
+                         'Estado del periodo': _cat_label(r['categoria'])})
+
+    return pd.DataFrame(rows, columns=COLS) if rows else pd.DataFrame(columns=COLS)
 
 
 def _cat_keys(label: str) -> set[str]:

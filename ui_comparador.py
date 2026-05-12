@@ -196,10 +196,17 @@ def render_comparison_tab() -> None:
 
     with f2:
         vacuna_sel = st.multiselect(
-            "Filtrar por vacuna",
+            "Filtrar por vacuna específica",
             options=all_dose_cols,
-            help="Deja vacío para ver todas las vacunas del esquema.",
+            help=(
+                "Selecciona una o más vacunas para ver su avance de manera independiente. "
+                "Deja vacío para ver el estado general de todas las vacunas del esquema."
+            ),
         )
+        if vacuna_sel:
+            st.caption(f"🔎 Mostrando: **{', '.join(vacuna_sel)}**")
+        else:
+            st.caption("📋 Vista general — todas las vacunas del esquema")
 
     with f3:
         eess_options = sorted({
@@ -209,7 +216,11 @@ def render_comparison_tab() -> None:
         eess_sel = st.multiselect("Filtrar por EESS", eess_options)
 
     # ── Tabla de resultados ───────────────────────────────────────────────────
-    st.markdown("### 📋 Detalle nominal de niños")
+    st.markdown("### 📋 Detalle nominal de niños — una fila por vacuna")
+    st.caption(
+        "Cada fila representa **una vacuna** de un niño. "
+        "Usa el filtro de vacuna para ver el avance de una dosis específica."
+    )
 
     df_det = to_dataframe(results, dose_filter=vacuna_sel or None, cat_filter=cat_sel)
 
@@ -219,22 +230,26 @@ def render_comparison_tab() -> None:
     if df_det.empty:
         st.warning("No hay registros con los filtros aplicados.")
     else:
-        st.caption(f"Mostrando **{len(df_det):,}** registros")
+        n_ninos  = df_det['DNI'].nunique()
+        n_filas  = len(df_det)
+        st.caption(
+            f"Mostrando **{n_filas:,}** dosis de **{n_ninos:,}** niños"
+        )
         st.dataframe(
             df_det,
             use_container_width=True,
             hide_index=True,
             height=460,
             column_config={
-                "RIS":                   st.column_config.TextColumn("RIS",                  width="medium"),
-                "Zona Sanitaria":        st.column_config.TextColumn("Zona Sanitaria",       width="medium"),
-                "EESS":                  st.column_config.TextColumn("EESS",                 width="medium"),
-                "DNI":                   st.column_config.TextColumn("DNI",                  width="small"),
-                "Nombres":               st.column_config.TextColumn("Nombres",              width="large"),
-                "Prioridad actual":      st.column_config.TextColumn("Prioridad actual",     width="medium"),
-                "Categoría":             st.column_config.TextColumn("Categoría",            width="medium"),
-                "Vacunas administradas": st.column_config.TextColumn("Vacunas administradas",width="large"),
-                "Vacunas pendientes":    st.column_config.TextColumn("Vacunas pendientes",   width="large"),
+                "RIS":                st.column_config.TextColumn("RIS",               width="medium"),
+                "Zona Sanitaria":     st.column_config.TextColumn("Zona Sanitaria",    width="medium"),
+                "EESS":               st.column_config.TextColumn("EESS",              width="medium"),
+                "DNI":                st.column_config.TextColumn("DNI",               width="small"),
+                "Nombres":            st.column_config.TextColumn("Nombres",           width="large"),
+                "Prioridad actual":   st.column_config.TextColumn("Prioridad actual",  width="medium"),
+                "Categoría":          st.column_config.TextColumn("Categoría",         width="medium"),
+                "Vacuna":             st.column_config.TextColumn("Vacuna",            width="medium"),
+                "Estado del periodo": st.column_config.TextColumn("Estado del periodo",width="medium"),
             },
         )
 
