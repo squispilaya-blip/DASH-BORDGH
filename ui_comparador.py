@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
-"""ui_comparador.py — Pestaña de comparación de dos padrones por RIS."""
+"""
+ui_comparador.py — Pestaña de comparación de dos reportes exportados.
+
+El usuario sube dos archivos Excel del mismo RIS pero de fechas distintas
+(exportados desde el dashboard), y se compara qué niños se vacunaron
+y cuáles siguen faltando.
+"""
 
 import io
 from datetime import date
@@ -10,210 +16,250 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from comparador import CATEGORIAS, compare_reports, summary_by_ris
-from processor import build_all
+from comparador_exportado import (
+    DOSE_COLS, compare_reportes, get_dose_cols_in,
+    load_reporte, to_dataframe,
+)
 
 
-# ── Helpers internos ──────────────────────────────────────────────────────────
+# ── Caché de carga ────────────────────────────────────────────────────────────
 
-def _fecha_corte(df: pd.DataFrame) -> str:
-    if "FECHA_CORTE_PADRON_N" in df.columns:
-        val = df["FECHA_CORTE_PADRON_N"].iloc[0]
-        return str(val) if pd.notna(val) else "—"
-    return "—"
+@st.cache_data(show_spinner="Cargando reporte...")
+def _load(file_bytes: bytes) -> pd.DataFrame:
+    return load_reporte(file_bytes)
 
 
-def _changes_to_df(changes: list) -> pd.DataFrame:
-    rows = [
-        {
-            "RIS":               c["Red"],
-            "Zona Sanitaria":    c["Microred"],
-            "EESS":              c["EESS"],
-            "DNI":               c["DNI"],
-            "Nombres":           c["Nombres"],
-            "Categoría":         CATEGORIAS.get(c["categoria"], c["categoria"]),
-            "Cambios vacunales": c["detalle"],
-        }
-        for c in changes
-    ]
-    return (
-        pd.DataFrame(rows)
-        if rows
-        else pd.DataFrame(
-            columns=["RIS", "Zona Sanitaria", "EESS", "DNI", "Nombres",
-                     "Categoría", "Cambios vacunales"]
-        )
-    )
+# ── Export Excel ──────────────────────────────────────────────────────────────
 
-
-def _export_excel(df_summary: pd.DataFrame, df_detail: pd.DataFrame) -> bytes:
+def _export_excel(df_resumen: pd.DataFrame, df_detalle: pd.DataFrame) -> bytes:
     wb = Workbook()
-    _fill_sheet(wb.active, "Resumen por RIS", df_summary)
-    _fill_sheet(wb.create_sheet("Detalle cambios"), "Detalle cambios", df_detail)
+    _fill_ws(wb.active,           "Resumen",         df_resumen)
+    _fill_ws(wb.create_sheet(),   "Detalle completo", df_detalle)
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 
-def _fill_sheet(ws, title: str, df: pd.DataFrame) -> None:
+def _fill_ws(ws, title: str, df: pd.DataFrame) -> None:
     ws.title = title
     hfill = PatternFill(start_color="1A6FA8", end_color="1A6FA8", fill_type="solid")
     hfont = Font(bold=True, color="FFFFFF")
-    for col_i, h in enumerate(df.columns, 1):
-        cell = ws.cell(row=1, column=col_i, value=h)
-        cell.fill      = hfill
-        cell.font      = hfont
-        cell.alignment = Alignment(horizontal="center", wrap_text=True)
-
-    for row_i, row in enumerate(df.itertuples(index=False), 2):
-        for col_i, val in enumerate(row, 1):
-            c = ws.cell(row=row_i, column=col_i, value=val)
-            c.alignment = Alignment(wrap_text=True, vertical="top")
-
+    for ci, h in enumerate(df.columns, 1):
+        c = ws.cell(row=1, column=ci, value=h)
+        c.fill, c.font = hfill, hfont
+        c.alignment = Alignment(horizontal="center", wrap_text=True)
+    for ri, row in enumerate(df.itertuples(index=False), 2):
+        for ci, val in enumerate(row, 1):
+            ws.cell(row=ri, column=ci, value=val).alignment = Alignment(
+                wrap_text=True, vertical="top"
+            )
     for col in ws.columns:
         length = max(
-            (max((len(ln) for ln in str(cell.value or "").split("\n")), default=0)
-             for cell in col),
-            default=0,
+            (max((len(ln) for ln in str(c.value or "").split("\n")), default=0)
+             for c in col), default=0
         )
         ws.column_dimensions[get_column_letter(col[0].column)].width = min(length + 2, 50)
-
     ws.freeze_panes = "A2"
 
 
-# ── Pestaña principal ─────────────────────────────────────────────────────────
+# ── UI principal ──────────────────────────────────────────────────────────────
 
 def render_comparison_tab() -> None:
-    st.subheader("🔄 Comparar dos reportes de vacunación")
+    st.subheader("🔄 Comparar dos reportes del mismo RIS")
     st.caption(
-        "Sube el padrón **antiguo** y el **nuevo** para ver qué cambió "
-        "en la situación vacunal, agrupado por RIS."
+        "Sube el reporte **antiguo** y el **nuevo** (exportados desde el dashboard). "
+        "Identifica qué niños se vacunaron y quiénes siguen faltando."
     )
 
+    # ── Carga de archivos ─────────────────────────────────────────────────────
     col_a, col_b = st.columns(2)
     with col_a:
         file_a = st.file_uploader(
-            "📂 Padrón ANTIGUO (referencia)",
+            "📂 Reporte ANTIGUO (primera fecha)",
             type=["xlsx"],
             key="comp_a",
-            help="El reporte descargado anteriormente (ej. ayer).",
+            help="El reporte de la fecha anterior (ej. primera semana de abril).",
         )
     with col_b:
         file_b = st.file_uploader(
-            "📂 Padrón NUEVO (más reciente)",
+            "📂 Reporte NUEVO (fecha más reciente)",
             type=["xlsx"],
             key="comp_b",
-            help="El reporte descargado hoy o el más reciente.",
+            help="El reporte más reciente (ej. primera semana de mayo).",
         )
 
     if not file_a or not file_b:
-        st.info("Carga ambos padrones para ver la comparación.")
+        st.info("📋 Carga ambos reportes Excel para ver la comparación.")
         return
 
     try:
-        with st.spinner("Procesando padrón antiguo..."):
-            df_a, patients_a = build_all(file_a.read())
-        with st.spinner("Procesando padrón nuevo..."):
-            df_b, patients_b = build_all(file_b.read())
-    except ValueError as e:
-        st.error(str(e))
+        df_a = _load(file_a.read())
+        df_b = _load(file_b.read())
+    except Exception as e:
+        st.error(f"Error al leer los archivos: {e}")
         return
 
-    fc_a, fc_b = _fecha_corte(df_a), _fecha_corte(df_b)
+    # ── Validación básica ─────────────────────────────────────────────────────
+    if 'DNI' not in df_a.columns or 'DNI' not in df_b.columns:
+        st.error("Los archivos no tienen columna 'DNI'. Verifica que son reportes exportados del dashboard.")
+        return
+
+    ris_a = df_a['RIS'].iloc[0] if 'RIS' in df_a.columns else "—"
+    ris_b = df_b['RIS'].iloc[0] if 'RIS' in df_b.columns else "—"
+
     st.success(
-        f"**Padrón A (antiguo):** {len(df_a):,} pacientes — corte: {fc_a} &nbsp;|&nbsp; "
-        f"**Padrón B (nuevo):** {len(df_b):,} pacientes — corte: {fc_b}"
+        f"**Reporte A:** {len(df_a):,} niños — RIS: {ris_a} &nbsp;|&nbsp; "
+        f"**Reporte B:** {len(df_b):,} niños — RIS: {ris_b}"
     )
 
-    changes = compare_reports(patients_a, patients_b)
+    # ── Comparación ───────────────────────────────────────────────────────────
+    with st.spinner("Comparando reportes..."):
+        results = compare_reportes(df_a, df_b)
 
-    if not changes:
-        st.info("No se detectaron cambios entre los dos padrones.")
+    if not results:
+        st.info("No se detectaron cambios entre los dos reportes.")
         return
 
     # ── Métricas globales ─────────────────────────────────────────────────────
-    total_vac   = sum(1 for c in changes if c["categoria"] == "nuevo_vacunado")
-    total_new   = sum(1 for c in changes if c["categoria"] == "nuevo_padron")
-    total_ret   = sum(1 for c in changes if c["categoria"] == "retirado_padron")
-    total_otros = sum(1 for c in changes if c["categoria"] == "otro_cambio")
+    total_vac     = sum(1 for r in results if r['se_vacuno'])
+    total_falta   = sum(1 for r in results if r['sigue_faltando'] and not r['se_vacuno'])
+    total_parcial = sum(1 for r in results if r['se_vacuno'] and r['sigue_faltando'])
+    total_nuevos  = sum(1 for r in results if r['categoria'] == 'nuevo')
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("✅ Nuevos vacunados",  total_vac,
-              help="Pasaron de Pendiente/Incumplió a Aplicada entre los dos reportes")
-    m2.metric("➕ Nuevos en padrón", total_new,
-              help="DNI presente en el padrón nuevo pero no en el antiguo")
-    m3.metric("➖ Retirados",        total_ret,
-              help="DNI presente en el padrón antiguo pero no en el nuevo")
-    m4.metric("🔄 Otros cambios",    total_otros,
-              help="Cambios de estado que no son nuevas vacunaciones (ej. Pendiente → Incumplió)")
+    m1.metric(
+        "✅ Se vacunaron",
+        total_vac,
+        help="Niños que recibieron al menos una vacuna pendiente entre los dos reportes",
+    )
+    m2.metric(
+        "❌ Siguen faltando",
+        total_falta,
+        help="Niños que aún tienen vacunas pendientes en el reporte nuevo (sin ninguna nueva vacuna)",
+    )
+    m3.metric(
+        "⚠️ Parcial",
+        total_parcial,
+        help="Niños que se vacunaron en algunas dosis pero aún tienen otras pendientes",
+    )
+    m4.metric(
+        "➕ Nuevos en padrón",
+        total_nuevos,
+        help="Niños presentes en el reporte nuevo pero no en el anterior",
+    )
 
     st.divider()
 
-    # ── Resumen por RIS ───────────────────────────────────────────────────────
-    st.markdown("### Resumen por RIS")
-    df_summary = summary_by_ris(changes)
-    st.dataframe(df_summary, use_container_width=True, hide_index=True)
+    # ── Filtros ───────────────────────────────────────────────────────────────
+    st.markdown("### 🔍 Filtros")
 
-    st.divider()
+    # Vacunas disponibles en los archivos
+    all_dose_cols = [c for c in DOSE_COLS if c in set(get_dose_cols_in(df_a)) | set(get_dose_cols_in(df_b))]
 
-    # ── Filtros + detalle ─────────────────────────────────────────────────────
-    st.markdown("### Detalle de cambios")
-
-    redes = sorted({c["Red"] for c in changes})
-    cat_options = list(CATEGORIAS.values())
-    cat_key_by_label = {v: k for k, v in CATEGORIAS.items()}
-
-    f1, f2 = st.columns(2)
+    f1, f2, f3 = st.columns(3)
     with f1:
-        ris_filter = st.multiselect("Filtrar por RIS", redes)
+        cat_opciones = {
+            "Todos": None,
+            "✅ Se vacunaron":    "se_vacuno",
+            "❌ Siguen faltando": "sigue_faltando",
+            "⚠️ Parcial":        "parcial",
+        }
+        cat_sel_label = st.selectbox("Mostrar", list(cat_opciones.keys()))
+        cat_sel = cat_opciones[cat_sel_label]
+
     with f2:
-        cat_filter = st.selectbox("Filtrar por categoría", ["Todas"] + cat_options)
+        vacuna_sel = st.multiselect(
+            "Filtrar por vacuna",
+            options=all_dose_cols,
+            help="Deja vacío para ver todas las vacunas.",
+        )
 
-    filtered = changes
-    if ris_filter:
-        filtered = [c for c in filtered if c["Red"] in set(ris_filter)]
-    if cat_filter != "Todas":
-        cat_key = cat_key_by_label[cat_filter]
-        filtered = [c for c in filtered if c["categoria"] == cat_key]
+    with f3:
+        eess_options = sorted({r['EESS'] for r in results if r['EESS'] and r['EESS'] != 'nan'})
+        eess_sel = st.multiselect("Filtrar por EESS", eess_options)
 
-    df_detail = _changes_to_df(filtered)
+    # ── Tabla de resultados ───────────────────────────────────────────────────
+    st.markdown("### 📋 Detalle de niños")
 
-    if df_detail.empty:
+    df_det = to_dataframe(results, dose_filter=vacuna_sel or None, cat_filter=cat_sel)
+
+    # Filtro adicional por EESS
+    if eess_sel:
+        df_det = df_det[df_det['EESS'].isin(eess_sel)]
+
+    if df_det.empty:
         st.warning("No hay registros con los filtros aplicados.")
     else:
+        st.caption(f"Mostrando **{len(df_det):,}** registros")
         st.dataframe(
-            df_detail,
+            df_det,
             use_container_width=True,
             hide_index=True,
-            height=420,
+            height=460,
             column_config={
-                "RIS":               st.column_config.TextColumn("RIS",            width="medium"),
-                "Zona Sanitaria":    st.column_config.TextColumn("Zona Sanitaria", width="medium"),
-                "EESS":              st.column_config.TextColumn("EESS",           width="medium"),
-                "DNI":               st.column_config.TextColumn("DNI",            width="small"),
-                "Nombres":           st.column_config.TextColumn("Nombres",        width="medium"),
-                "Categoría":         st.column_config.TextColumn("Categoría",      width="medium"),
-                "Cambios vacunales": st.column_config.TextColumn("Cambios vacunales", width="large"),
+                "RIS":                  st.column_config.TextColumn("RIS",                width="medium"),
+                "Zona Sanitaria":       st.column_config.TextColumn("Zona Sanitaria",     width="medium"),
+                "EESS":                 st.column_config.TextColumn("EESS",               width="medium"),
+                "DNI":                  st.column_config.TextColumn("DNI",                width="small"),
+                "Nombres":              st.column_config.TextColumn("Nombres",            width="large"),
+                "Prioridad actual":     st.column_config.TextColumn("Prioridad actual",   width="medium"),
+                "Categoría":            st.column_config.TextColumn("Categoría",          width="medium"),
+                "Vacunas administradas":st.column_config.TextColumn("Vacunas administradas", width="large"),
+                "Vacunas pendientes":   st.column_config.TextColumn("Vacunas pendientes", width="large"),
             },
         )
+
+    # ── Resumen por EESS ──────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### 🏥 Resumen por EESS")
+
+    resumen_rows = []
+    eess_groups: dict = {}
+    for r in results:
+        eess = r['EESS']
+        if eess not in eess_groups:
+            eess_groups[eess] = {'vac': 0, 'falta': 0, 'parcial': 0, 'nuevo': 0}
+        if r['categoria'] == 'nuevo':
+            eess_groups[eess]['nuevo'] += 1
+        elif r['se_vacuno'] and r['sigue_faltando']:
+            eess_groups[eess]['parcial'] += 1
+        elif r['se_vacuno']:
+            eess_groups[eess]['vac'] += 1
+        elif r['sigue_faltando']:
+            eess_groups[eess]['falta'] += 1
+
+    for eess, s in sorted(eess_groups.items()):
+        resumen_rows.append({
+            'EESS':                eess,
+            '✅ Se vacunaron':     s['vac'],
+            '⚠️ Parcial':         s['parcial'],
+            '❌ Siguen faltando':  s['falta'],
+            '➕ Nuevos':           s['nuevo'],
+            'Total':               sum(s.values()),
+        })
+
+    df_resumen = pd.DataFrame(resumen_rows)
+    if not df_resumen.empty:
+        st.dataframe(df_resumen, use_container_width=True, hide_index=True)
 
     # ── Exportar ──────────────────────────────────────────────────────────────
     st.divider()
     col_btn, col_cap = st.columns([1, 3])
     with col_btn:
-        if st.button("📥 Generar Excel de comparación", use_container_width=True):
+        if st.button("📥 Generar Excel comparación", use_container_width=True):
             with st.spinner("Generando Excel..."):
-                excel_bytes = _export_excel(df_summary, _changes_to_df(changes))
+                df_all = to_dataframe(results)   # sin filtros para exportar todo
+                excel_bytes = _export_excel(df_resumen, df_all)
             fecha = date.today().strftime("%Y%m%d")
             st.download_button(
                 label="⬇️ Descargar comparación",
                 data=excel_bytes,
-                file_name=f"comparacion_vacunas_{fecha}.xlsx",
+                file_name=f"comparacion_{ris_b}_{fecha}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
     with col_cap:
         st.caption(
-            "El Excel incluye 2 hojas: 'Resumen por RIS' y 'Detalle cambios' "
-            f"con todos los {len(changes):,} registros (sin filtro)."
+            f"El Excel incluye 2 hojas: 'Resumen' por EESS y "
+            f"'Detalle completo' con los {len(results):,} registros."
         )

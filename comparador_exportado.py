@@ -1,0 +1,281 @@
+# -*- coding: utf-8 -*-
+"""
+comparador_exportado.py — Comparación de dos reportes Excel exportados
+del dashboard de vacunación.
+
+Los archivos de entrada son reportes ya procesados (no el padrón crudo),
+con columnas de dosis individuales como 'BCG', '1° Penta', 'Varicela', etc.
+"""
+
+import re
+import datetime
+import pandas as pd
+
+# ── Columnas de dosis en el orden del reporte exportado ──────────────────────
+DOSE_COLS = [
+    'BCG', 'HVB',
+    '1° Penta', '2° Penta', '3° Penta',
+    '1° IPV',   '2° IPV',   '3° IPV',   'Ref. IPV',
+    '1° Rota',  '2° Rota',
+    '1° Neumo', '2° Neumo', '3° Neumo',
+    '1° HiB',   '2° HiB',   '3° HiB',   'Ref. HiB',
+    'Inf.Ped',  'Inf.Adu',
+    '1° SPR',   '2° SPR',
+    'Varicela', 'Hep.A', 'Amaril.',
+    '1° DPT',   '2° DPT',
+    'APO',
+]
+
+# ── Estados internos ──────────────────────────────────────────────────────────
+ST_APLICADA      = 'APLICADA'
+ST_PENDIENTE     = 'PENDIENTE'
+ST_INCUMPLIO     = 'INCUMPLIÓ'
+ST_FUERA_EDAD    = 'FUERA DE EDAD'
+ST_NO_APLICA     = 'NO APLICA AÚN'
+ST_NO_CORRESPONDE = 'N/C'
+ST_ERROR         = 'ERROR'
+
+NEEDS_VACCINE = {ST_PENDIENTE, ST_INCUMPLIO, ST_ERROR}
+IS_APPLIED    = {ST_APLICADA}
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def parse_status(val) -> str:
+    """
+    Determina el estado vacunal a partir del valor de una celda
+    del reporte exportado.
+
+    Valores posibles:
+      '✅ 08/04/2026'            → APLICADA
+      '🕐 08/04/2026 (tardía)'   → APLICADA
+      '⚠️ Pendiente · ...'       → PENDIENTE
+      '❌ Incumplió · ...'       → INCUMPLIÓ
+      '🚫 Vencida'               → FUERA DE EDAD
+      '🔴 Error reg. ...'        → ERROR
+      '— ...' / datetime / fecha → NO APLICA AÚN
+      'N/C'                      → N/C
+    """
+    if val is None:
+        return ST_NO_CORRESPONDE
+    if isinstance(val, float):
+        return ST_NO_CORRESPONDE if pd.isna(val) else ST_NO_APLICA
+    if isinstance(val, (datetime.datetime, datetime.date)):
+        return ST_NO_APLICA
+
+    s = str(val).strip()
+    if not s or s in ('nan', 'None', 'NaN'):
+        return ST_NO_CORRESPONDE
+
+    # Aplicada (emojis verdes)
+    if s.startswith('✅') or s.startswith('🕐'):
+        return ST_APLICADA
+
+    # Error de registro
+    if '🔴' in s or 'Error reg' in s:
+        return ST_ERROR
+
+    # Incumplió
+    if '❌' in s or 'Incumplió' in s:
+        return ST_INCUMPLIO
+
+    # Fuera de edad
+    if '🚫' in s or 'Vencida' in s:
+        return ST_FUERA_EDAD
+
+    # Pendiente
+    if '⚠️' in s or 'Pendiente' in s:
+        return ST_PENDIENTE
+
+    # No corresponde
+    if s in ('N/C', 'N/A'):
+        return ST_NO_CORRESPONDE
+
+    # No aplica aún (fecha programada o "—")
+    if s.startswith('—') or s == '—':
+        return ST_NO_APLICA
+
+    # Cadena de solo fecha "dd/mm/yyyy" (fecha programada exportada como texto)
+    if re.match(r'^\d{2}/\d{2}/\d{4}$', s):
+        return ST_NO_APLICA
+
+    # Texto del tipo "DA anual: 08/01/2026" → dosis aplicada
+    if re.search(r'\d{2}/\d{2}/\d{4}', s):
+        return ST_APLICADA
+
+    return ST_NO_CORRESPONDE
+
+
+def load_reporte(file_bytes: bytes) -> pd.DataFrame:
+    """
+    Carga un reporte Excel exportado desde el dashboard.
+
+    Espera cualquier hoja (sheet_name=0) con columnas:
+    DNI, Nombres, RIS, Zona Sanitaria, EESS, Prioridad + columnas de dosis.
+    """
+    df = pd.read_excel(file_bytes, sheet_name=0, dtype={'DNI': str})
+    if 'DNI' in df.columns:
+        df['DNI'] = df['DNI'].astype(str).str.strip()
+    return df
+
+
+def get_dose_cols_in(df: pd.DataFrame) -> list[str]:
+    """Devuelve las columnas de dosis presentes en el DataFrame."""
+    return [c for c in DOSE_COLS if c in df.columns]
+
+
+def compare_reportes(df_a: pd.DataFrame, df_b: pd.DataFrame) -> list[dict]:
+    """
+    Compara dos reportes exportados por DNI.
+
+    Devuelve una lista de dicts, uno por paciente relevante:
+        DNI, Nombres, RIS, Zona Sanitaria, EESS, Prioridad,
+        se_vacuno         — bool: al menos 1 dosis pasó de PENDIENTE/INCUMPLIÓ → APLICADA
+        sigue_faltando    — bool: al menos 1 dosis sigue en PENDIENTE/INCUMPLIÓ en el nuevo reporte
+        vacunas_administradas — list[str]: dosis recién vacunadas
+        vacunas_pendientes    — list[str]: dosis que siguen pendientes
+        categoria         — 'se_vacuno' | 'sigue_faltando' | 'parcial' | 'nuevo' | 'retirado'
+        en_a, en_b        — bool: presencia en cada reporte
+    """
+    # Columnas de dosis: unión de ambos reportes en el orden de DOSE_COLS
+    cols_a = set(get_dose_cols_in(df_a))
+    cols_b = set(get_dose_cols_in(df_b))
+    dose_cols = [c for c in DOSE_COLS if c in cols_a | cols_b]
+
+    dict_a = {str(r['DNI']).strip(): r for _, r in df_a.iterrows() if pd.notna(r.get('DNI'))}
+    dict_b = {str(r['DNI']).strip(): r for _, r in df_b.iterrows() if pd.notna(r.get('DNI'))}
+    all_dnis = sorted(set(dict_a) | set(dict_b))
+
+    results = []
+    for dni in all_dnis:
+        in_a = dni in dict_a
+        in_b = dni in dict_b
+        row_a = dict_a.get(dni)
+        row_b = dict_b.get(dni)
+        ref   = row_b if row_b is not None else row_a  # datos descriptivos del paciente
+
+        base = {
+            'DNI':           dni,
+            'Nombres':       str(ref.get('Nombres', '')),
+            'RIS':           str(ref.get('RIS', '')),
+            'Zona Sanitaria': str(ref.get('Zona Sanitaria', '')),
+            'EESS':          str(ref.get('EESS', '')),
+            'Prioridad':     str(row_b.get('Prioridad', '') if row_b is not None else ''),
+            'en_a': in_a,
+            'en_b': in_b,
+        }
+
+        # Paciente nuevo (solo en B)
+        if in_b and not in_a:
+            pendientes = [c for c in dose_cols if parse_status(row_b.get(c)) in NEEDS_VACCINE]
+            base.update({
+                'se_vacuno': False,
+                'sigue_faltando': bool(pendientes),
+                'vacunas_administradas': [],
+                'vacunas_pendientes': pendientes,
+                'categoria': 'nuevo',
+            })
+            results.append(base)
+            continue
+
+        # Paciente retirado (solo en A)
+        if in_a and not in_b:
+            base.update({
+                'se_vacuno': False,
+                'sigue_faltando': False,
+                'vacunas_administradas': [],
+                'vacunas_pendientes': [],
+                'categoria': 'retirado',
+            })
+            results.append(base)
+            continue
+
+        # Paciente en ambos reportes — comparar dosis
+        administradas = []
+        pendientes    = []
+        for col in dose_cols:
+            st_a = parse_status(row_a.get(col))
+            st_b = parse_status(row_b.get(col))
+            if st_a in NEEDS_VACCINE and st_b in IS_APPLIED:
+                administradas.append(col)
+            if st_b in NEEDS_VACCINE:
+                pendientes.append(col)
+
+        se_vacuno      = bool(administradas)
+        sigue_faltando = bool(pendientes)
+
+        # Solo incluir pacientes con algo relevante
+        if not se_vacuno and not sigue_faltando:
+            continue
+
+        if se_vacuno and sigue_faltando:
+            categoria = 'parcial'
+        elif se_vacuno:
+            categoria = 'se_vacuno'
+        else:
+            categoria = 'sigue_faltando'
+
+        base.update({
+            'se_vacuno':            se_vacuno,
+            'sigue_faltando':       sigue_faltando,
+            'vacunas_administradas': administradas,
+            'vacunas_pendientes':   pendientes,
+            'categoria':            categoria,
+        })
+        results.append(base)
+
+    return results
+
+
+def to_dataframe(results: list[dict], dose_filter: list[str] | None = None,
+                 cat_filter: str | None = None) -> pd.DataFrame:
+    """
+    Convierte los resultados en un DataFrame listo para mostrar.
+
+    dose_filter — si se indica, solo incluye filas donde alguna de esas
+                  vacunas aparece en administradas o pendientes.
+    cat_filter  — 'se_vacuno' | 'sigue_faltando' | 'parcial' | None (todos)
+    """
+    rows = []
+    for r in results:
+        if cat_filter and r['categoria'] not in _cat_keys(cat_filter):
+            continue
+        if dose_filter:
+            relevant = set(r.get('vacunas_administradas', [])) | set(r.get('vacunas_pendientes', []))
+            if not relevant.intersection(dose_filter):
+                continue
+        rows.append({
+            'RIS':                   r['RIS'],
+            'Zona Sanitaria':        r['Zona Sanitaria'],
+            'EESS':                  r['EESS'],
+            'DNI':                   r['DNI'],
+            'Nombres':               r['Nombres'],
+            'Prioridad actual':      r['Prioridad'],
+            'Categoría':             _cat_label(r['categoria']),
+            'Vacunas administradas': ', '.join(r.get('vacunas_administradas', [])) or '—',
+            'Vacunas pendientes':    ', '.join(r.get('vacunas_pendientes', []))    or '—',
+        })
+    return pd.DataFrame(rows) if rows else pd.DataFrame(
+        columns=['RIS', 'Zona Sanitaria', 'EESS', 'DNI', 'Nombres',
+                 'Prioridad actual', 'Categoría',
+                 'Vacunas administradas', 'Vacunas pendientes']
+    )
+
+
+def _cat_keys(label: str) -> set[str]:
+    """Mapea label de UI → claves internas de categoría."""
+    return {
+        'se_vacuno':      {'se_vacuno', 'parcial'},
+        'sigue_faltando': {'sigue_faltando', 'parcial'},
+        'parcial':        {'parcial'},
+    }.get(label, {'se_vacuno', 'sigue_faltando', 'parcial', 'nuevo', 'retirado'})
+
+
+def _cat_label(cat: str) -> str:
+    return {
+        'se_vacuno':      '✅ Se vacunó',
+        'sigue_faltando': '❌ Sigue faltando',
+        'parcial':        '⚠️ Parcial (vacunó + falta)',
+        'nuevo':          '➕ Nuevo en padrón',
+        'retirado':       '➖ Retirado del padrón',
+    }.get(cat, cat)
