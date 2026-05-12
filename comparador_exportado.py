@@ -280,3 +280,98 @@ def _cat_label(cat: str) -> str:
         'nuevo':          '➕ Nuevo en padrón',
         'retirado':       '➖ Retirado del padrón',
     }.get(cat, cat)
+
+
+# ── Informe estadístico ───────────────────────────────────────────────────────
+
+def build_summary_df(df_a: pd.DataFrame, df_b: pd.DataFrame,
+                     results: list[dict]) -> pd.DataFrame:
+    """
+    Genera un resumen estadístico detallado por EESS con totales RIS.
+
+    Columnas resultantes:
+      RIS | EESS
+      Total Reporte A (1er corte)   — niños en el primer archivo
+      Total Reporte B (2do corte)   — niños en el segundo archivo
+      Vacunados en el periodo       — cambiaron de PENDIENTE/INCUMPLIÓ → APLICADA
+                                      (incluye los "parciales")
+      Parcialmente vacunados        — vacunaron algunas dosis, aún faltan otras
+      Nuevos niños ingresados       — aparecen en B pero no en A
+      No vacunados en el periodo    — siguen con dosis pendientes sin vacunarse
+      Retirados del padrón          — estaban en A pero no en B
+    """
+    def _eess_counts(df: pd.DataFrame) -> dict:
+        if 'EESS' not in df.columns:
+            return {}
+        return df.groupby('EESS', sort=False).size().to_dict()
+
+    counts_a = _eess_counts(df_a)
+    counts_b = _eess_counts(df_b)
+
+    # Mapa EESS → RIS (preferir df_b, luego df_a)
+    ris_by_eess: dict[str, str] = {}
+    for df in (df_a, df_b):
+        if 'EESS' in df.columns and 'RIS' in df.columns:
+            for _, row in df[['EESS', 'RIS']].drop_duplicates().iterrows():
+                ris_by_eess[str(row['EESS'])] = str(row['RIS'])
+
+    # Estadísticas por EESS desde los resultados de comparación
+    stats: dict[str, dict] = {}
+    for r in results:
+        eess = str(r['EESS'])
+        if eess not in stats:
+            stats[eess] = {
+                'vacunados': 0, 'parciales': 0,
+                'nuevos': 0, 'no_vacunados': 0, 'retirados': 0,
+            }
+        cat = r['categoria']
+        if cat == 'se_vacuno':
+            stats[eess]['vacunados'] += 1
+        elif cat == 'parcial':
+            stats[eess]['vacunados'] += 1
+            stats[eess]['parciales'] += 1
+        elif cat == 'nuevo':
+            stats[eess]['nuevos'] += 1
+        elif cat == 'sigue_faltando':
+            stats[eess]['no_vacunados'] += 1
+        elif cat == 'retirado':
+            stats[eess]['retirados'] += 1
+
+    all_eess = sorted(
+        set(list(counts_a) + list(counts_b) + list(stats)),
+        key=lambda e: (ris_by_eess.get(e, ''), e)
+    )
+
+    rows = []
+    for eess in all_eess:
+        s = stats.get(eess, {
+            'vacunados': 0, 'parciales': 0,
+            'nuevos': 0, 'no_vacunados': 0, 'retirados': 0,
+        })
+        rows.append({
+            'RIS':                           ris_by_eess.get(eess, ''),
+            'EESS':                          eess,
+            'Total Reporte A (1er corte)':   counts_a.get(eess, 0),
+            'Total Reporte B (2do corte)':   counts_b.get(eess, 0),
+            'Vacunados en el periodo':       s['vacunados'],
+            'Parcialmente vacunados':        s['parciales'],
+            'Nuevos niños ingresados':       s['nuevos'],
+            'No vacunados en el periodo':    s['no_vacunados'],
+            'Retirados del padrón':          s['retirados'],
+        })
+
+    df = pd.DataFrame(rows)
+
+    if not df.empty:
+        num_cols = [
+            'Total Reporte A (1er corte)', 'Total Reporte B (2do corte)',
+            'Vacunados en el periodo', 'Parcialmente vacunados',
+            'Nuevos niños ingresados', 'No vacunados en el periodo',
+            'Retirados del padrón',
+        ]
+        total_row: dict = {'RIS': 'TOTAL GENERAL', 'EESS': '—'}
+        for col in num_cols:
+            total_row[col] = int(df[col].sum())
+        df = pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
+
+    return df
