@@ -196,17 +196,18 @@ def render_comparison_tab() -> None:
 
     with f2:
         vacuna_sel = st.multiselect(
-            "Filtrar por vacuna específica",
+            "Vacuna específica",
             options=all_dose_cols,
             help=(
-                "Selecciona una o más vacunas para ver su avance de manera independiente. "
-                "Deja vacío para ver el estado general de todas las vacunas del esquema."
+                "Selecciona una vacuna para ver solo esa columna. "
+                "Deja vacío para ver todas las vacunas del esquema completo."
             ),
+            placeholder="Todas las vacunas del esquema",
         )
         if vacuna_sel:
-            st.caption(f"🔎 Mostrando: **{', '.join(vacuna_sel)}**")
+            st.caption(f"🔎 **{', '.join(vacuna_sel)}**")
         else:
-            st.caption("📋 Vista general — todas las vacunas del esquema")
+            st.caption("📋 Esquema completo")
 
     with f3:
         eess_options = sorted({
@@ -216,11 +217,17 @@ def render_comparison_tab() -> None:
         eess_sel = st.multiselect("Filtrar por EESS", eess_options)
 
     # ── Tabla de resultados ───────────────────────────────────────────────────
-    st.markdown("### 📋 Detalle nominal de niños — una fila por vacuna")
-    st.caption(
-        "Cada fila representa **una vacuna** de un niño. "
-        "Usa el filtro de vacuna para ver el avance de una dosis específica."
-    )
+    st.markdown("### 📋 Detalle nominal de niños")
+    if vacuna_sel:
+        st.caption(
+            f"Vista por vacuna: **{', '.join(vacuna_sel)}** — "
+            "cada columna muestra el estado de esa dosis para cada niño."
+        )
+    else:
+        st.caption(
+            "Vista general del esquema completo — "
+            "cada columna de vacuna muestra ✅ Vacunado o ❌ Pendiente."
+        )
 
     df_det = to_dataframe(results, dose_filter=vacuna_sel or None, cat_filter=cat_sel)
 
@@ -230,27 +237,33 @@ def render_comparison_tab() -> None:
     if df_det.empty:
         st.warning("No hay registros con los filtros aplicados.")
     else:
-        n_ninos  = df_det['DNI'].nunique()
-        n_filas  = len(df_det)
+        n_ninos = len(df_det)
+        # Columnas de dosis presentes en el DataFrame actual
+        dose_cols_shown = [c for c in DOSE_COLS if c in df_det.columns]
         st.caption(
-            f"Mostrando **{n_filas:,}** dosis de **{n_ninos:,}** niños"
+            f"Mostrando **{n_ninos:,}** niños · "
+            f"**{len(dose_cols_shown)}** vacuna(s) en el esquema"
         )
+
+        # column_config dinámico: columnas fijas + dosis al ancho pequeño
+        col_cfg: dict = {
+            "RIS":              st.column_config.TextColumn("RIS",             width="medium"),
+            "Zona Sanitaria":   st.column_config.TextColumn("Zona Sanitaria",  width="medium"),
+            "EESS":             st.column_config.TextColumn("EESS",            width="medium"),
+            "DNI":              st.column_config.TextColumn("DNI",             width="small"),
+            "Nombres":          st.column_config.TextColumn("Nombres",         width="large"),
+            "Prioridad actual": st.column_config.TextColumn("Prioridad actual",width="medium"),
+            "Categoría":        st.column_config.TextColumn("Categoría",       width="medium"),
+        }
+        for dose in dose_cols_shown:
+            col_cfg[dose] = st.column_config.TextColumn(dose, width="small")
+
         st.dataframe(
             df_det,
             use_container_width=True,
             hide_index=True,
-            height=460,
-            column_config={
-                "RIS":                st.column_config.TextColumn("RIS",               width="medium"),
-                "Zona Sanitaria":     st.column_config.TextColumn("Zona Sanitaria",    width="medium"),
-                "EESS":               st.column_config.TextColumn("EESS",              width="medium"),
-                "DNI":                st.column_config.TextColumn("DNI",               width="small"),
-                "Nombres":            st.column_config.TextColumn("Nombres",           width="large"),
-                "Prioridad actual":   st.column_config.TextColumn("Prioridad actual",  width="medium"),
-                "Categoría":          st.column_config.TextColumn("Categoría",         width="medium"),
-                "Vacuna":             st.column_config.TextColumn("Vacuna",            width="medium"),
-                "Estado del periodo": st.column_config.TextColumn("Estado del periodo",width="medium"),
-            },
+            height=480,
+            column_config=col_cfg,
         )
 
     # ── Resumen por EESS (en pantalla) ────────────────────────────────────────

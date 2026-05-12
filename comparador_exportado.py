@@ -231,34 +231,48 @@ def compare_reportes(df_a: pd.DataFrame, df_b: pd.DataFrame) -> list[dict]:
 def to_dataframe(results: list[dict], dose_filter: list[str] | None = None,
                  cat_filter: str | None = None) -> pd.DataFrame:
     """
-    Convierte los resultados en DataFrame EXPANDIDO: una fila por niño por vacuna.
+    Una fila por niño. Una columna por vacuna con su estado individual.
 
-    Esto permite visualizar el estado de cada dosis de manera independiente.
+    Columnas fijas  : RIS, Zona Sanitaria, EESS, DNI, Nombres,
+                      Prioridad actual, Categoría
+    Columnas de dosis (dinámicas, en orden de DOSE_COLS):
+        '✅ Vacunado'  — pasó de PENDIENTE/INCUMPLIÓ → APLICADA en este periodo
+        '❌ Pendiente' — sigue pendiente en el segundo reporte
+        ''             — no aplica / no tiene ese estado relevante
 
-    dose_filter — lista de vacunas a mostrar (None = todas)
+    dose_filter — muestra solo esas columnas de vacuna (None = todas las presentes)
     cat_filter  — 'se_vacuno' | 'sigue_faltando' | 'parcial' | None (todos)
     """
-    COLS = [
-        'RIS', 'Zona Sanitaria', 'EESS', 'DNI', 'Nombres',
-        'Prioridad actual', 'Categoría', 'Vacuna', 'Estado del periodo',
-    ]
+    BASE_COLS = ['RIS', 'Zona Sanitaria', 'EESS', 'DNI', 'Nombres',
+                 'Prioridad actual', 'Categoría']
 
     rows = []
     for r in results:
         if cat_filter and r['categoria'] not in _cat_keys(cat_filter):
             continue
 
-        administradas = list(r.get('vacunas_administradas', []))
-        pendientes    = list(r.get('vacunas_pendientes',    []))
+        administradas = set(r.get('vacunas_administradas', []))
+        pendientes    = set(r.get('vacunas_pendientes',    []))
+        all_relevant  = administradas | pendientes
 
-        # Filtrar por vacuna específica si se indicó
+        # Filtrar por vacuna específica
         if dose_filter:
-            administradas = [v for v in administradas if v in dose_filter]
-            pendientes    = [v for v in pendientes    if v in dose_filter]
-            if not administradas and not pendientes:
+            if not all_relevant.intersection(dose_filter):
                 continue
+        elif not all_relevant:
+            # Niños sin dosis relevantes (nuevo sin pendientes, retirado)
+            rows.append({
+                'RIS':              r['RIS'],
+                'Zona Sanitaria':   r['Zona Sanitaria'],
+                'EESS':             r['EESS'],
+                'DNI':              r['DNI'],
+                'Nombres':          r['Nombres'],
+                'Prioridad actual': r['Prioridad'],
+                'Categoría':        _cat_label(r['categoria']),
+            })
+            continue
 
-        base = {
+        row: dict = {
             'RIS':              r['RIS'],
             'Zona Sanitaria':   r['Zona Sanitaria'],
             'EESS':             r['EESS'],
@@ -268,22 +282,32 @@ def to_dataframe(results: list[dict], dose_filter: list[str] | None = None,
             'Categoría':        _cat_label(r['categoria']),
         }
 
-        for vac in administradas:
-            rows.append({**base,
-                         'Vacuna':             vac,
-                         'Estado del periodo': '✅ Vacunado en el periodo'})
-        for vac in pendientes:
-            rows.append({**base,
-                         'Vacuna':             vac,
-                         'Estado del periodo': '❌ Pendiente'})
+        # Una columna por dosis, en el orden estándar de DOSE_COLS
+        doses_to_check = dose_filter if dose_filter else DOSE_COLS
+        for dose in doses_to_check:
+            if dose in administradas:
+                row[dose] = '✅ Vacunado'
+            elif dose in pendientes:
+                row[dose] = '❌ Pendiente'
+            # Si no aplica → la celda queda vacía (NaN → '' tras fillna)
 
-        # Niños sin dosis relevantes (nuevo sin pendientes, retirado)
-        if not administradas and not pendientes:
-            rows.append({**base,
-                         'Vacuna':             '—',
-                         'Estado del periodo': _cat_label(r['categoria'])})
+        rows.append(row)
 
-    return pd.DataFrame(rows, columns=COLS) if rows else pd.DataFrame(columns=COLS)
+    if not rows:
+        return pd.DataFrame(columns=BASE_COLS)
+
+    df = pd.DataFrame(rows)
+
+    # Rellenar NaN con '' en columnas de dosis
+    dose_cols_in_df = [c for c in DOSE_COLS if c in df.columns]
+    if dose_cols_in_df:
+        df[dose_cols_in_df] = df[dose_cols_in_df].fillna('')
+        # Sin filtro específico: eliminar columnas de dosis completamente vacías
+        if not dose_filter:
+            empty = [c for c in dose_cols_in_df if (df[c] == '').all()]
+            df = df.drop(columns=empty)
+
+    return df
 
 
 def _cat_keys(label: str) -> set[str]:
